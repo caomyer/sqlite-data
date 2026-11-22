@@ -783,6 +783,9 @@
       let tablesWithChangedSchemas = currentRecordTypeByTableName.filter { tableName, recordType in
         previousRecordTypeByTableName[tableName]?.schema != recordType.schema
       }
+      .sorted {
+        topologicallyAscending(lhsTableName: $0.key, rhsTableName: $1.key, rootFirst: true)
+      }
 
       for (tableName, currentRecordType) in tablesWithChangedSchemas {
         guard let table = tablesByName[tableName]
