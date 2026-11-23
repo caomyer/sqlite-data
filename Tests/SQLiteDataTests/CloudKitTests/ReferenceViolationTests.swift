@@ -473,6 +473,43 @@
           """
         }
       }
+
+      // * A list and a reminder in it are added in one write.
+      // * The list's save never reaches the server (its save was refused and dropped, or it
+      //   failed alone), so the reminder's save is refused with 'referenceViolation'.
+      // => The reminder is kept, not deleted: the list was never on the server, so nothing
+      //    deleted it. Both are sent again with the next change, list first.
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func childOfUnsavedParent_IsKeptAndSentAgain() async throws {
+        let deferred = LockIsolated<[SyncEngine.DeferredRecord]>([])
+        syncEngine.onDeferredRecord { record in deferred.withValue { $0.append(record) } }
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Personal")
+            Reminder(id: 1, title: "Get milk", remindersListID: 1)
+          }
+        }
+        syncEngine.private.state.remove(pendingRecordZoneChanges: [.saveRecord(RemindersList.recordID(for: 1))])
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        try await userDatabase.read { db in
+          try #expect(Reminder.find(1).fetchCount(db) == 1, "who it belongs to is still here")
+        }
+        #expect(deferred.value == [SyncEngine.DeferredRecord(recordType: Reminder.tableName, reason: .waitingForParent)])
+
+        try await userDatabase.userWrite { db in
+          try Reminder.insert { Reminder(id: 2, title: "Get bread", remindersListID: 1) }.execute(db)
+        }
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+
+        try await userDatabase.read { db in
+          try #expect(Reminder.count().fetchOne(db) == 2)
+        }
+        let saved = syncEngine.private.database.state.withValue { state in
+          state.storage.values.flatMap { $0.records.keys.map(\.recordName) }.sorted()
+        }
+        #expect(saved == ["1:reminders", "1:remindersLists", "2:reminders"], "the list, then both reminders")
+      }
     }
   }
 #endif

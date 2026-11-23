@@ -33,6 +33,31 @@
     package let tablesByOrder: [String: Int]
     let foreignKeysByTableName: [String: [ForeignKey]]
     package let syncEngines = LockIsolated<SyncEngines>(SyncEngines())
+
+    /// A record whose save the server refused, kept on this device and sent again later
+    /// instead of being lost: one whose parent hadn't reached the server yet, or one the
+    /// server turned down. Told once per refusal, for an app to show (and to count).
+    public struct DeferredRecord: Sendable, Equatable {
+      public enum Reason: Sendable, Equatable {
+        /// Its parent had never been saved to the server, so it waits for the parent.
+        case waitingForParent
+        /// The server refused it (`serverRejectedRequest`).
+        case refusedByServer
+      }
+      public var recordType: String
+      public var reason: Reason
+      public init(recordType: String, reason: Reason) {
+        self.recordType = recordType
+        self.reason = reason
+      }
+    }
+
+    private let deferredRecordHandler = LockIsolated<(@Sendable (DeferredRecord) -> Void)?>(nil)
+
+    /// Told each time a refused save is kept and queued to be sent again (`DeferredRecord`).
+    public func onDeferredRecord(_ handler: (@Sendable (DeferredRecord) -> Void)?) {
+      deferredRecordHandler.setValue(handler)
+    }
     package let defaultZone: CKRecordZone
     package let delegate: (any SyncEngineDelegate)?
     let defaultSyncEngines:
@@ -1762,6 +1787,21 @@
         syncEngine.state.add(pendingRecordZoneChanges: newPendingRecordZoneChanges)
       }
       var permissionFailedRecordTypes: [CKRecord.ID: String] = [:]
+      /// Sends a refused save again, paced: it waits in the pending table for the next local
+      /// change or the next start, so a record the server keeps refusing never loops.
+      func deferSave(_ recordIDs: [CKRecord.ID], _ deferred: DeferredRecord) async {
+        await withErrorReporting(.sqliteDataCloudKitFailure) {
+          try await userDatabase.write { db in
+            try PendingRecordZoneChange.insert {
+              for recordID in recordIDs {
+                PendingRecordZoneChange(.saveRecord(recordID), databaseScope: recordID.zoneID.databaseScope)
+              }
+            }
+            .execute(db)
+          }
+        }
+        deferredRecordHandler.value?(deferred)
+      }
       for (failedRecord, error) in failedRecordSaves {
         func clearServerRecord() async {
           await withErrorReporting(.sqliteDataCloudKitFailure) {
@@ -1792,8 +1832,38 @@
 
         case .serverRejectedRequest:
           await clearServerRecord()
+          // Sent again later while the row is still here, rather than never reaching any
+          // other device.
+          let stillHere = await withErrorReporting(.sqliteDataCloudKitFailure) {
+            try await metadatabase.read { db in
+              try SyncMetadata.find(failedRecord.recordID).fetchCount(db) > 0
+            }
+          } ?? false
+          if stillHere {
+            await deferSave(
+              [failedRecord.recordID],
+              DeferredRecord(recordType: failedRecord.recordType, reason: .refusedByServer)
+            )
+          }
 
         case .referenceViolation:
+          // A parent this device made that never reached the server: the child waits for it
+          // instead of being deleted, and both are sent again, parent first. Only a parent the
+          // server once had, and has no more, takes its children with it below.
+          if let parentID = failedRecord.parent?.recordID {
+            let parentNeverSaved = await withErrorReporting(.sqliteDataCloudKitFailure) {
+              try await metadatabase.read { db in
+                try SyncMetadata.find(parentID).where { !$0.hasLastKnownServerRecord }.fetchCount(db) > 0
+              }
+            } ?? false
+            if parentNeverSaved {
+              await deferSave(
+                [parentID, failedRecord.recordID],
+                DeferredRecord(recordType: failedRecord.recordType, reason: .waitingForParent)
+              )
+              continue
+            }
+          }
           guard
             let recordPrimaryKey = failedRecord.recordID.recordPrimaryKey,
             let table = tablesByName[failedRecord.recordType],
